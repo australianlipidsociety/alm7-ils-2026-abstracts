@@ -63,7 +63,7 @@ function displayAuthor(part){const m=norm(part).match(/^(.*?)(?:\^([0-9,]+))?$/)
 function displayAffiliations(raw){return norm(raw).split(';').filter(Boolean).map(part=>{const s=part.trim();const m=s.match(/^([0-9,]+)\^(.*)$/);return m?`${supDigits(m[1])} ${m[2].trim()}`:s}).join('; ')}
 function keywordList(raw){return norm(raw).split(/[,;]/).map(x=>x.trim()).filter(Boolean).slice(0,5)}
 function formatTime(v){if(v===null||v===undefined||v==='')return '';if(typeof v==='string'&&/:/.test(v))return v.replace(/\s+/g,' ').trim();let n=Number(v);if(!Number.isFinite(n))return norm(v);if(n>1)n=n%1;let mins=Math.round(n*1440);if(mins>=1440)mins%=1440;return `${pad(Math.floor(mins/60))}:${pad(mins%60)}`}
-function presentationMeta(pr,sp){const parts=norm(pr.Notes).split('·').map(x=>x.trim()).filter(Boolean);const day=parts.find(x=>/^(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\b/i.test(x))||'';const venue=parts.find(x=>/Room|Ballroom|Theatre|Hall/i.test(x))||norm(sp?.PosterLocation)||(!day&&parts.length===1?parts[0]:'');return {day,time:formatTime(pr.StartTime)||formatTime(sp?.PosterTime),venue}}
+function presentationMeta(pr,sp){const parts=norm(pr.Notes).split('·').map(x=>x.trim()).filter(Boolean);const sm=(window.BOOK_SESSION_META||{})[norm(pr.SessionID)]||{};const noteDay=parts.find(x=>/^(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\b/i.test(x))||'';const noteVenue=parts.find(x=>/Room|Ballroom|Theatre|Hall/i.test(x))||norm(sp?.PosterLocation)||(!noteDay&&parts.length===1?parts[0]:'');const day=norm(sm.day)||noteDay;const venue=norm(sm.venue)||noteVenue;return {day,time:formatTime(pr.StartTime)||formatTime(sp?.PosterTime),venue}}
 function normalizePresentationId(v){return norm(v).toUpperCase().replace(/^PR0+/,'PR')}
 const sponsorAliases={'sciex':['sciex'],'agilent':['agilent'],'bruker':['bruker'],'trajan':['trajan'],'national deuration facility':['ndf','ansto'],'national deuteration facility':['ndf','ansto'],'waters':['waters'],'avanti research':['avanti'],'thermo fisher scientific':['thermo fisher','thermo scientific']};
 function sponsorLogo(s){const name=norm(s?.Name).toLowerCase();if(name.includes('thermo'))return 'assets/sponsors/thermo-fisher-approved.png';if(name.includes('nutrients'))return 'assets/sponsors/nutrients-approved.png';if(name.includes('metabolites'))return 'assets/sponsors/metabolites-v2.png';if(name.includes('business')||name.includes('perth'))return 'assets/sponsors/business-events-perth.png';return norm(s?.LogoURL)}
@@ -356,9 +356,57 @@ function renderAuthorIndex(p){
 }
 
 async function renderPage(p){if(p.kind==='static')return renderStatic(p);if(p.kind==='toc-main')return renderTocMain(p);if(p.kind==='toc-category')return renderTocCategory(p);if(p.kind==='speaker')return renderSpeaker(p);if(p.kind==='abstract')return renderAbstract(p);if(p.kind==='author-index')return renderAuthorIndex(p);throw new Error(`Unknown page kind ${p.kind}`)}
-function canvasToBlobUrl(c){return new Promise((resolve,reject)=>{try{c.toBlob(b=>{if(!b)return reject(new Error('Canvas export failed'));resolve(URL.createObjectURL(b))},'image/png')}catch(err){reject(new Error('Canvas export failed: '+(err?.message||err)))}})}
+function dataUrlToBlobUrl(dataUrl){
+  const comma=dataUrl.indexOf(',');
+  if(comma<0)throw new Error('Invalid canvas data URL');
+  const meta=dataUrl.slice(0,comma),payload=dataUrl.slice(comma+1);
+  const mime=(meta.match(/^data:([^;,]+)/)||[])[1]||'image/png';
+  const binary=meta.includes(';base64')?atob(payload):decodeURIComponent(payload);
+  const bytes=new Uint8Array(binary.length);
+  for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
+  return URL.createObjectURL(new Blob([bytes],{type:mime}));
+}
+function tryToBlob(c,type='image/png',quality){
+  return new Promise(resolve=>{
+    try{c.toBlob(b=>resolve(b||null),type,quality)}catch(_){resolve(null)}
+  });
+}
+async function canvasToBlobUrl(c){
+  // Primary path: native asynchronous PNG encoding.
+  let blob=await tryToBlob(c,'image/png');
+  if(blob)return URL.createObjectURL(blob);
+
+  // Some browsers occasionally return null from toBlob() on large canvases.
+  // Yield one frame, then try the synchronous encoder as a compatibility fallback.
+  await new Promise(r=>requestAnimationFrame(()=>r()));
+  try{
+    const dataUrl=c.toDataURL('image/png');
+    if(dataUrl&&dataUrl!=='data:,')return dataUrlToBlobUrl(dataUrl);
+  }catch(_){/* try a smaller compatibility canvas below */}
+
+  // Last-resort compatibility path: downsample only the page that failed.
+  // This avoids aborting the entire booklet while keeping the normal 3x pages untouched.
+  for(const scale of [2,1.5,1]){
+    try{
+      const tmp=document.createElement('canvas');
+      tmp.width=Math.max(1,Math.round(W*scale));
+      tmp.height=Math.max(1,Math.round(H*scale));
+      const tctx=tmp.getContext('2d');
+      if(!tctx)continue;
+      tctx.imageSmoothingEnabled=true;
+      tctx.imageSmoothingQuality='high';
+      tctx.drawImage(c,0,0,tmp.width,tmp.height);
+      blob=await tryToBlob(tmp,'image/png');
+      if(blob){tmp.width=1;tmp.height=1;return URL.createObjectURL(blob)}
+      const dataUrl=tmp.toDataURL('image/png');
+      tmp.width=1;tmp.height=1;
+      if(dataUrl&&dataUrl!=='data:,')return dataUrlToBlobUrl(dataUrl);
+    }catch(_){/* continue to the next smaller scale */}
+  }
+  throw new Error('Canvas export failed after compatibility fallbacks');
+}
 async function renderAll(){pageUrls.forEach(URL.revokeObjectURL);pageUrls=[];hotspotsByIndex=[];loadingText.textContent='Stacking the lipid bilayers…';for(let i=0;i<pages.length;i++){progress.textContent=`${Math.round(((i+1)/pages.length)*100)}%`;const res=await renderPage(pages[i]);hotspotsByIndex.push(res.hotspots||[]);pageUrls.push(await canvasToBlobUrl(res.canvas));if(i%6===0)await new Promise(r=>setTimeout(r,0))}loadingText.textContent='Packing the lipid layers for display…';await preloadUrls(pageUrls);progress.textContent='';window.__BOOK_EXPORT={pages:pages.map(p=>({key:p.key,pageNo:p.pageNo,title:p.title||'',kind:p.kind,category:p.category||''})),pageUrls:[...pageUrls],hotspotsByIndex:hotspotsByIndex.map(x=>x.map(h=>({...h}))),dataMode:dataMode.textContent};window.__BOOK_EXPORT_READY=true;}
-async function preloadUrls(urls){let next=0;const workers=Array.from({length:Math.min(10,urls.length)},async()=>{while(next<urls.length){const i=next++;await new Promise(resolve=>{const im=new Image();const done=()=>resolve();im.onload=done;im.onerror=done;im.src=urls[i];if(im.decode)im.decode().then(done).catch(()=>{})})}});await Promise.all(workers)}
+async function preloadUrls(urls){let next=0;const workers=Array.from({length:Math.min(4,urls.length)},async()=>{while(next<urls.length){const i=next++;await new Promise(resolve=>{const im=new Image();const done=()=>resolve();im.onload=done;im.onerror=done;im.src=urls[i];if(im.decode)im.decode().then(done).catch(()=>{})})}});await Promise.all(workers)}
 
 function buildDrawer(){const groups=[['Front matter',['about','committee','sponsors']],['Invited Speakers',pages.filter(p=>p.kind==='speaker').map(p=>p.key)],['Oral Presentations',pages.filter(p=>p.kind==='abstract'&&p.category==='oral').map(p=>p.key)],['Rapid Fire',pages.filter(p=>p.kind==='abstract'&&p.category==='rapid').map(p=>p.key)],['Poster Presentations',pages.filter(p=>p.kind==='abstract'&&p.category==='poster').map(p=>p.key)],['Index',[pages.find(p=>p.kind==='author-index')?.key].filter(Boolean)]];const html=[];for(const [title,keys] of groups){html.push(`<h3>${esc(title)}</h3>`);for(const key of keys){const p=pages.find(x=>x.key===key);if(!p)continue;let label=p.title||p.key;if(p.kind==='abstract')label=`${p.withdrawn?'Withdrawn':p.bookId}${p.posterNo&&p.category==='rapid'?` · Poster ${p.posterNo}`:''} — ${norm(p.abstract?.Title)||norm(p.presentation?.Title)}`;if(p.kind==='speaker')label=`${norm(p.presentation?.PresentationType)} — ${norm(p.speaker?.DisplayName||p.presentation?.SpeakerDisplay)}`;html.push(`<button class="jump ${p.kind==='abstract'?'small':''}" type="button" data-goto="${esc(key)}"><span>${esc(label)}</span><b>${pad(p.pageNo)}</b></button>`)}}drawerContents.innerHTML=html.join('')}
 function hideCrispOverlay(){if(crispOverlay){crispOverlay.style.display='none';crispOverlay.innerHTML=''}}
@@ -447,7 +495,18 @@ function next(){if(pf){if(currentIndex<visiblePageCount-1)pf.flipNext('bottom')}
 function prev(){if(pf)pf.flipPrev('bottom');else showFallback(Math.max(0,fallbackIndex-1))}
 function showFallback(i=0){fallbackIndex=Math.max(0,Math.min(visiblePageCount-1,i));if(!fallback){fallback=document.createElement('div');fallback.className='fallback';fallback.innerHTML='<img alt="Book page">';flipbook.replaceWith(fallback)}fallback.querySelector('img').src=pageUrls[fallbackIndex];current.textContent=fallbackIndex+1;loading.style.display='none'}
 function updateHotspots(){linkOverlay.innerHTML='';if(!pf)return;let state='';try{state=pf.getState?.()||''}catch(_){}if(state==='flipping'||state==='user_fold')return;const canv=document.querySelector('#flipbook canvas');if(!canv)return;const br=canv.getBoundingClientRect(),vr=viewer.getBoundingClientRect();let orientation='landscape';try{orientation=pf.getOrientation()}catch(_){}const cur=pf.getCurrentPageIndex();const visible=orientation==='portrait'?[cur]:[cur,cur+1].filter(i=>i<pages.length);const pageW=orientation==='portrait'?br.width:br.width/2,sx=pageW/W,sy=br.height/H;visible.forEach((pi,slot)=>{for(const h of hotspotsByIndex[pi]||[]){const b=document.createElement('button');b.type='button';b.style.left=(br.left-vr.left+viewer.scrollLeft+slot*pageW+h.x*sx)+'px';b.style.top=(br.top-vr.top+viewer.scrollTop+h.y*sy)+'px';b.style.width=(h.w*sx)+'px';b.style.height=(h.h*sy)+'px';b.addEventListener('pointerdown',e=>e.stopPropagation());b.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();goToKey(h.target)});linkOverlay.appendChild(b)}})}
-function initPageFlip(){
+let pageFlipPaddingUrl='';
+function makePageFlipPaddingUrl(){
+  // PageFlip can briefly leave the previous sheet painted underneath the final
+  // turn when the book has an odd number of real pages. Give the renderer a
+  // private blank partner page so the last real page turns as a complete spread.
+  // This page is never counted, linked, shown in the contents, or reachable by
+  // the navigation controls.
+  const c=document.createElement('canvas');c.width=W;c.height=H;
+  const ctx=c.getContext('2d');ctx.fillStyle='#ffffff';ctx.fillRect(0,0,W,H);
+  return new Promise(resolve=>c.toBlob(b=>resolve(b?URL.createObjectURL(b):''),'image/png'))
+}
+async function initPageFlip(){
   visiblePageCount=pages.filter(p=>!p.hidden).length;total.textContent=visiblePageCount;keyToIndex=new Map(pages.map((p,i)=>[p.key,i]));
   if(!(window.St&&St.PageFlip))throw new Error('PageFlip library unavailable');
   const mobile=window.matchMedia('(max-width:850px)').matches;
@@ -456,10 +515,12 @@ function initPageFlip(){
   pf.on('changeState',e=>{if(e.data!=='read'){linkOverlay.innerHTML='';hideCrispOverlay()}else setTimeout(()=>{updateHotspots();updateCrispOverlay()},40)});
   pf.on('changeOrientation',()=>setTimeout(()=>{updateHotspots();updateCrispOverlay()},80));
   pf.on('init',()=>{currentIndex=0;current.textContent=1;loading.style.display='none';setTimeout(()=>{applyZoom();updateHotspots();updateCrispOverlay()},120)});
-  pf.loadFromImages(pageUrls)
+  const flipUrls=[...pageUrls];
+  if(visiblePageCount%2===1){pageFlipPaddingUrl=await makePageFlipPaddingUrl();if(pageFlipPaddingUrl)flipUrls.push(pageFlipPaddingUrl)}
+  pf.loadFromImages(flipUrls)
 }
 async function init(){try{const data=await getData();pages=buildModel(data);buildDrawer();await renderAll();initPageFlip()}catch(err){console.error(err);loadingText.textContent='Could not prepare the page-turning book.';progress.textContent=err?.message||String(err);try{if(pageUrls.length){visiblePageCount=pages.filter(p=>!p.hidden).length;showFallback(0)}}catch(_){}}}
 
-document.getElementById('nextBtn').addEventListener('click',next);document.getElementById('prevBtn').addEventListener('click',prev);document.getElementById('firstBtn').addEventListener('click',()=>go(0));document.getElementById('contentsBtn').addEventListener('click',()=>drawer.classList.add('open'));document.getElementById('closeDrawer').addEventListener('click',()=>drawer.classList.remove('open'));drawer.addEventListener('click',e=>{const b=e.target.closest('[data-goto]');if(!b)return;goToKey(b.dataset.goto);drawer.classList.remove('open')});document.getElementById('zoomOut').addEventListener('click',()=>setZoom(zoomLevel-zoomStep));document.getElementById('zoomIn').addEventListener('click',()=>setZoom(zoomLevel+zoomStep));zoomValue.addEventListener('click',()=>setZoom(1));document.addEventListener('keydown',e=>{if(e.key==='ArrowRight')next();if(e.key==='ArrowLeft')prev();if((e.ctrlKey||e.metaKey)&&(e.key==='+'||e.key==='=')){e.preventDefault();setZoom(zoomLevel+zoomStep)}if((e.ctrlKey||e.metaKey)&&e.key==='-'){e.preventDefault();setZoom(zoomLevel-zoomStep)}if((e.ctrlKey||e.metaKey)&&e.key==='0'){e.preventDefault();setZoom(1)}});window.addEventListener('resize',()=>setTimeout(()=>{updateHotspots();updateCrispOverlay()},100));viewer.addEventListener('scroll',()=>{updateHotspots();updateCrispOverlay()},{passive:true});window.addEventListener('beforeunload',()=>pageUrls.forEach(URL.revokeObjectURL));
+document.getElementById('nextBtn').addEventListener('click',next);document.getElementById('prevBtn').addEventListener('click',prev);document.getElementById('firstBtn').addEventListener('click',()=>go(0));document.getElementById('contentsBtn').addEventListener('click',()=>drawer.classList.add('open'));document.getElementById('closeDrawer').addEventListener('click',()=>drawer.classList.remove('open'));drawer.addEventListener('click',e=>{const b=e.target.closest('[data-goto]');if(!b)return;goToKey(b.dataset.goto);drawer.classList.remove('open')});document.getElementById('zoomOut').addEventListener('click',()=>setZoom(zoomLevel-zoomStep));document.getElementById('zoomIn').addEventListener('click',()=>setZoom(zoomLevel+zoomStep));zoomValue.addEventListener('click',()=>setZoom(1));document.addEventListener('keydown',e=>{if(e.key==='ArrowRight')next();if(e.key==='ArrowLeft')prev();if((e.ctrlKey||e.metaKey)&&(e.key==='+'||e.key==='=')){e.preventDefault();setZoom(zoomLevel+zoomStep)}if((e.ctrlKey||e.metaKey)&&e.key==='-'){e.preventDefault();setZoom(zoomLevel-zoomStep)}if((e.ctrlKey||e.metaKey)&&e.key==='0'){e.preventDefault();setZoom(1)}});window.addEventListener('resize',()=>setTimeout(()=>{updateHotspots();updateCrispOverlay()},100));viewer.addEventListener('scroll',()=>{updateHotspots();updateCrispOverlay()},{passive:true});window.addEventListener('beforeunload',()=>{pageUrls.forEach(URL.revokeObjectURL);if(pageFlipPaddingUrl)URL.revokeObjectURL(pageFlipPaddingUrl)});
 init();
 })();
