@@ -75,9 +75,15 @@ function sponsorFor(pr,a,sponsors){
     const byAbstract=(sponsors||[]).find(x=>norm(x.AbstractID)&&norm(x.AbstractID)===aid);
     return byAbstract||findSponsorByName(sponsors,'sciex');
   }
-  // Sponsor posters are explicitly mapped from PRESENTATIONS so ordinary abstracts are never mislabelled.
+  // Sponsor posters follow the sponsor table first, so highlighted posters can be changed in the sheet without code edits.
   if(ptype==='Poster'){
-    const explicit={PR076:'agilent',PR077:'national deuration facility',PR078:'bruker',PR080:'trajan',PR081:'thermo fisher',PR082:'waters'};
+    const normPid=normalizePresentationId(pid);
+    const byPresentation=(sponsors||[]).find(x=>norm(x.PresentationID)&&normalizePresentationId(x.PresentationID)===normPid);
+    if(byPresentation)return byPresentation;
+    const byAbstract=(sponsors||[]).find(x=>norm(x.AbstractID)&&norm(x.AbstractID)===aid);
+    if(byAbstract)return byAbstract;
+    // Backward-compatible fallback for older snapshots that did not store sponsor mappings.
+    const explicit={PR076:'agilent',PR077:'national deuration facility',PR078:'bruker',PR080:'trajan',PR081:'thermo fisher'};
     return explicit[pid]?findSponsorByName(sponsors,explicit[pid]):null;
   }
   return null
