@@ -3,7 +3,7 @@
 
 const CONFIG=window.BOOK_CONFIG||{};
 const SNAPSHOT=window.BOOK_SNAPSHOT||{};
-const W=595,H=842,SCALE=3;
+const W=595,H=842,SCALE=2;
 const C={navy:'#123f60',navy2:'#0b3554',teal:'#1492a4',tealLight:'#70d0d8',paper:'#f6f7f8',ink:'#123f60',body:'#405461',muted:'#667984',line:'#ccd8dd',gold:'#d4ad4d',coral:'#d8795e',white:'#ffffff',tag:'#e5f0f3'};
 const flipbook=document.getElementById('flipbook');
 const viewer=document.querySelector('.viewer');
@@ -19,6 +19,8 @@ const linkOverlay=document.getElementById('linkOverlay');
 const crispOverlay=document.getElementById('crispOverlay');
 const zoomValue=document.getElementById('zoomValue');
 const FORCE_SNAPSHOT=new URLSearchParams(location.search).has('snapshot')||window.BOOK_FORCE_SNAPSHOT===true;
+const FORCE_LIVE=new URLSearchParams(location.search).has('live');
+const FAST_LIVE_TIMEOUT=1400;
 let pf=null,pages=[],pageUrls=[],hotspotsByIndex=[],keyToIndex=new Map(),currentIndex=0,visiblePageCount=0,fallbackIndex=0,fallback=null;
 let zoomLevel=1;const minZoom=.60,maxZoom=1.30,zoomStep=.10;
 const imageCache=new Map();
@@ -47,10 +49,37 @@ function loadSheetOnce(sheetName,range,attempt=1){return new Promise((resolve,re
 async function loadSheet(sheetName,range){let lastErr;for(let attempt=1;attempt<=2;attempt++){try{return await loadSheetOnce(sheetName,range,attempt)}catch(err){lastErr=err;if(attempt<2)await new Promise(r=>setTimeout(r,350))}}throw lastErr}
 async function getData(){
   const specs=[['PRESENTATIONS',CONFIG.sheets.PRESENTATIONS],['ABSTRACTS',CONFIG.sheets.ABSTRACTS],['SPEAKERS',CONFIG.sheets.SPEAKERS],['SPONSORS',CONFIG.sheets.SPONSORS]];
-  if(FORCE_SNAPSHOT){dataMode.textContent='Snapshot';dataMode.classList.add('snapshot');return Object.fromEntries(specs.map(([n])=>[n,SNAPSHOT[n]||[]]))}
-  const out={};let live=0;
-  await Promise.all(specs.map(async([name,range])=>{try{out[name]=await loadSheet(name,range);live++}catch(err){console.warn(name,'using snapshot',err);out[name]=SNAPSHOT[name]||[]}}));
-  dataMode.textContent=live===specs.length?'Live sheet':live?'Live + fallback':'Snapshot';dataMode.classList.toggle('snapshot',live!==specs.length);return out;
+  const snapshot=()=>Object.fromEntries(specs.map(([n])=>[n,SNAPSHOT[n]||[]]));
+  if(FORCE_SNAPSHOT){dataMode.textContent='Snapshot';dataMode.classList.add('snapshot');return snapshot()}
+
+  const livePromise=(async()=>{
+    const out={};let live=0;
+    await Promise.all(specs.map(async([name,range])=>{try{out[name]=await loadSheet(name,range);live++}catch(err){console.warn(name,'using snapshot',err);out[name]=SNAPSHOT[name]||[]}}));
+    return {out,live};
+  })();
+
+  // The booklet snapshot is refreshed whenever the conference data changes. For a fast first paint,
+  // wait only briefly for Google Sheets; if it is slow, use the bundled snapshot immediately instead
+  // of making visitors stare at the loading screen for several seconds. Add ?live to force the live sheet.
+  if(!FORCE_LIVE){
+    const raced=await Promise.race([
+      livePromise.then(x=>({kind:'live',...x})),
+      new Promise(resolve=>setTimeout(()=>resolve({kind:'snapshot'}),FAST_LIVE_TIMEOUT))
+    ]);
+    if(raced.kind==='snapshot'){
+      dataMode.textContent='Fast snapshot';dataMode.classList.add('snapshot');
+      livePromise.catch(()=>{}); // allow the network requests to settle without blocking display
+      return snapshot();
+    }
+    dataMode.textContent=raced.live===specs.length?'Live sheet':raced.live?'Live + fallback':'Snapshot';
+    dataMode.classList.toggle('snapshot',raced.live!==specs.length);
+    return raced.out;
+  }
+
+  const result=await livePromise;
+  dataMode.textContent=result.live===specs.length?'Live sheet':result.live?'Live + fallback':'Snapshot';
+  dataMode.classList.toggle('snapshot',result.live!==specs.length);
+  return result.out;
 }
 
 function cleanName(name){return norm(name).replace(/\^\d+(?:,\d+)*/g,'').replace(/\s+/g,' ').trim()}
@@ -411,7 +440,31 @@ async function canvasToBlobUrl(c){
   }
   throw new Error('Canvas export failed after compatibility fallbacks');
 }
-async function renderAll(){pageUrls.forEach(URL.revokeObjectURL);pageUrls=[];hotspotsByIndex=[];loadingText.textContent='Stacking the lipid bilayers…';for(let i=0;i<pages.length;i++){progress.textContent=`${Math.round(((i+1)/pages.length)*100)}%`;const res=await renderPage(pages[i]);hotspotsByIndex.push(res.hotspots||[]);pageUrls.push(await canvasToBlobUrl(res.canvas));if(i%6===0)await new Promise(r=>setTimeout(r,0))}loadingText.textContent='Packing the lipid layers for display…';await preloadUrls(pageUrls);progress.textContent='';window.__BOOK_EXPORT={pages:pages.map(p=>({key:p.key,pageNo:p.pageNo,title:p.title||'',kind:p.kind,category:p.category||''})),pageUrls:[...pageUrls],hotspotsByIndex:hotspotsByIndex.map(x=>x.map(h=>({...h}))),dataMode:dataMode.textContent};window.__BOOK_EXPORT_READY=true;}
+async function renderAll(){
+  pageUrls.forEach(URL.revokeObjectURL);pageUrls=new Array(pages.length);hotspotsByIndex=new Array(pages.length);
+  loadingText.textContent='Stacking the lipid bilayers…';
+  let next=0,done=0;
+  const workerCount=Math.min(2,pages.length);
+  const workers=Array.from({length:workerCount},async()=>{
+    while(true){
+      const i=next++;if(i>=pages.length)break;
+      const res=await renderPage(pages[i]);
+      hotspotsByIndex[i]=res.hotspots||[];
+      pageUrls[i]=await canvasToBlobUrl(res.canvas);
+      // Release the large backing store as soon as the encoded page exists.
+      try{res.canvas.width=1;res.canvas.height=1}catch(_){}
+      done++;progress.textContent=`${Math.round((done/pages.length)*100)}%`;
+      if(done%8===0)await new Promise(r=>setTimeout(r,0));
+    }
+  });
+  await Promise.all(workers);
+  loadingText.textContent='Opening the book…';
+  // Warm only the first spread. PageFlip loads the remaining local blob images itself.
+  await preloadUrls(pageUrls.slice(0,4));
+  progress.textContent='';
+  window.__BOOK_EXPORT={pages:pages.map(p=>({key:p.key,pageNo:p.pageNo,title:p.title||'',kind:p.kind,category:p.category||''})),pageUrls:[...pageUrls],hotspotsByIndex:hotspotsByIndex.map(x=>(x||[]).map(h=>({...h}))),dataMode:dataMode.textContent};
+  window.__BOOK_EXPORT_READY=true;
+}
 async function preloadUrls(urls){let next=0;const workers=Array.from({length:Math.min(4,urls.length)},async()=>{while(next<urls.length){const i=next++;await new Promise(resolve=>{const im=new Image();const done=()=>resolve();im.onload=done;im.onerror=done;im.src=urls[i];if(im.decode)im.decode().then(done).catch(()=>{})})}});await Promise.all(workers)}
 
 function buildDrawer(){const groups=[['Front matter',['about','committee','sponsors']],['Invited Speakers',pages.filter(p=>p.kind==='speaker').map(p=>p.key)],['Oral Presentations',pages.filter(p=>p.kind==='abstract'&&p.category==='oral').map(p=>p.key)],['Rapid Fire',pages.filter(p=>p.kind==='abstract'&&p.category==='rapid').map(p=>p.key)],['Poster Presentations',pages.filter(p=>p.kind==='abstract'&&p.category==='poster').map(p=>p.key)],['Index',[pages.find(p=>p.kind==='author-index')?.key].filter(Boolean)]];const html=[];for(const [title,keys] of groups){html.push(`<h3>${esc(title)}</h3>`);for(const key of keys){const p=pages.find(x=>x.key===key);if(!p)continue;let label=p.title||p.key;if(p.kind==='abstract')label=`${p.withdrawn?'Withdrawn':p.bookId}${p.posterNo&&p.category==='rapid'?` · Poster ${p.posterNo}`:''} — ${norm(p.abstract?.Title)||norm(p.presentation?.Title)}`;if(p.kind==='speaker')label=`${norm(p.presentation?.PresentationType)} — ${norm(p.speaker?.DisplayName||p.presentation?.SpeakerDisplay)}`;html.push(`<button class="jump ${p.kind==='abstract'?'small':''}" type="button" data-goto="${esc(key)}"><span>${esc(label)}</span><b>${pad(p.pageNo)}</b></button>`)}}drawerContents.innerHTML=html.join('')}
